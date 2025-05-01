@@ -24,6 +24,7 @@ internal class DeviceInfo {
         return Bundle.main.bundlePath.hasSuffix(".appex")
     }
     
+    #if canImport(UIKit)
     private static func getiOSUserAgent() -> String {
         if !isRunningInExtension() {
             let webView = WKWebView(frame: .zero)
@@ -68,6 +69,7 @@ internal class DeviceInfo {
 
         return userAgent
     }
+    #endif
 
     private static func getMacOSUserAgent() -> String {
         let processInfo = ProcessInfo.processInfo
