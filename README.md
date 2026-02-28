@@ -22,14 +22,14 @@ The OpenPanel Swift SDK allows you to integrate OpenPanel analytics into your iO
 You can add OpenPanel to an Xcode project by adding it as a package dependency.
 
 1. From the **File** menu, select **Add Packages...**
-2. Enter `https://github.com/Openpanel-dev/swift-sdk` into the package repository URL text field
+2. Enter `https://github.com/binarydreams-io/openpanel-swift-sdk` into the package repository URL text field
 3. Click **Add Package**
 
 Alternatively, if you have a `Package.swift` file, you can add OpenPanel as a dependency:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Openpanel-dev/swift-sdk")
+  .package(url: "https://github.com/binarydreams-io/openpanel-swift-sdk")
 ]
 ```
 
@@ -47,8 +47,9 @@ Then, initialize the OpenPanel SDK with your client ID:
 
 ```swift
 OpenPanel.initialize(options: .init(
-    clientId: "YOUR_CLIENT_ID",
-    clientSecret: "YOUR_CLIENT_SECRET"
+  clientId: "YOUR_CLIENT_ID",
+  clientSecret: "YOUR_CLIENT_SECRET",
+  apiUrl: "https://analytics.yourdomain.com/api"
 ))
 ```
 
@@ -66,11 +67,11 @@ To identify a user:
 
 ```swift
 OpenPanel.identify(payload: IdentifyPayload(
-    profileId: "user123",
-    firstName: "John",
-    lastName: "Doe",
-    email: "john@example.com",
-    properties: ["subscription": "premium"]
+  profileId: "user123",
+  firstName: "John",
+  lastName: "Doe",
+  email: "john@example.com",
+  properties: ["subscription": "premium"]
 ))
 ```
 
@@ -80,8 +81,8 @@ To set properties that will be sent with every event:
 
 ```swift
 OpenPanel.setGlobalProperties([
-    "app_version": "1.0.2",
-    "environment": "production"
+  "app_version": "1.0.2",
+  "environment": "production"
 ])
 ```
 
@@ -117,9 +118,9 @@ You can temporarily disable tracking during initialization:
 
 ```swift
 OpenPanel.initialize(options: .init(
-    clientId: "YOUR_CLIENT_ID",
-    clientSecret: "YOUR_CLIENT_SECRET",
-    disabled: true
+  clientId: "YOUR_CLIENT_ID",
+  clientSecret: "YOUR_CLIENT_SECRET",
+  disabled: true
 ))
 ```
 
@@ -129,19 +130,15 @@ You can set up custom event filtering during initialization:
 
 ```swift
 OpenPanel.initialize(options: .init(
-    clientId: "YOUR_CLIENT_ID",
-    clientSecret: "YOUR_CLIENT_SECRET",
-    filter: { payload in
-        // Your custom filtering logic here
-        return true // or false to filter out the event
-    }
+  clientId: "YOUR_CLIENT_ID",
+  clientSecret: "YOUR_CLIENT_SECRET",
+  filter: { payload in
+    // Your custom filtering logic here
+    return true // or false to filter out the event
+  }
 ))
 ```
 
 ## Thread Safety
 
 The OpenPanel SDK is designed to be thread-safe. You can call its methods from any thread without additional synchronization.
-
-## Automatic Tracking
-
-The SDK automatically tracks app lifecycle events (`app_opened` and `app_closed`) if `automaticTracking` is set to `true` during initialization.
