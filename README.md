@@ -1,144 +1,104 @@
-# OpenPanel Swift SDK
+# OpenPanel SDK (Swift)
 
-The OpenPanel Swift SDK allows you to integrate OpenPanel analytics into your iOS, macOS, tvOS, and watchOS applications.
+Zero-dependency Swift SDK for [OpenPanel](https://github.com/Openpanel-dev/openpanel) analytics.
+Talks to the `POST /track` ingestion endpoint at `api.openpanel.dev`.
 
-## Features
+- iOS 16 / macOS 13 / tvOS 16 / watchOS 9 / visionOS 1
+- No external dependencies (stdlib + Foundation + URLSession)
+- Synchronous fire-and-forget API — no `await` or `try` at call sites
+- `actor`-isolated singleton, all I/O on background tasks
+- In-memory queue for `disabled: true` deferred startup
 
-- Easy-to-use API for tracking events and user properties
-- Automatic collection of app states
-- Support for custom event properties
-- Shared instance for easy access throughout your app
-
-## Requirements
-
-- iOS 13.0+ / macOS 10.15+ / tvOS 13.0+ / watchOS 6.0+
-- Xcode 12.0+
-- Swift 5.3+
-
-## Installation
-
-### Swift Package Manager
-
-You can add OpenPanel to an Xcode project by adding it as a package dependency.
-
-1. From the **File** menu, select **Add Packages...**
-2. Enter `https://github.com/binarydreams-io/openpanel-swift-sdk` into the package repository URL text field
-3. Click **Add Package**
-
-Alternatively, if you have a `Package.swift` file, you can add OpenPanel as a dependency:
+## Install
 
 ```swift
-dependencies: [
-  .package(url: "https://github.com/binarydreams-io/openpanel-swift-sdk")
-]
+.package(url: "https://github.com/binarydreams-io/openpanel-swift-sdk.git", from: "1.0.0"),
 ```
 
 ## Usage
 
-### Initialization
-
-First, import the SDK in your Swift file:
+Call `OpenPanel.initialize(_:)` once at app start, then use the static API
+from anywhere. All methods are synchronous — network I/O, retries, and error
+handling happen in the background.
 
 ```swift
 import OpenPanel
+
+// App launch
+OpenPanel.initialize(.init(
+    clientId: "00000000-0000-0000-0000-000000000000",
+    clientSecret: "your-client-secret",
+    debug: true
+))
+
+// Anywhere in the app
+OpenPanel.identify(.init(profileId: "user_123", email: "leo@example.com"))
+OpenPanel.track("screen_view", properties: ["screen": "Home"])
+OpenPanel.setGroup("acme-inc")       // requires identify() first
+OpenPanel.increment(property: "login_count")  // requires identify() first
+OpenPanel.revenue(999, properties: ["currency": "USD"])
 ```
 
-Then, initialize the OpenPanel SDK with your client ID:
+Calling any method before `initialize` is a **fatal error** — the SDK must be
+initialized before use. This is intentional: launch-time analytics
+(`app_launch`, first-screen views, etc.) are critical, and a silent no-op
+would let an "init order" bug ship to production. The crash surfaces the
+misuse on the very first dev run so the developer can re-order startup.
+
+`initialize` is idempotent — calling it a second time replaces the config and
+wipes all cached state (profile, groups, global props, queue, device/session IDs).
+
+## Configuration
 
 ```swift
-OpenPanel.initialize(options: .init(
-  clientId: "YOUR_CLIENT_ID",
-  clientSecret: "YOUR_CLIENT_SECRET",
-  apiUrl: "https://analytics.yourdomain.com/api"
+OpenPanel.Config(
+    clientId: String,                 // required — your project's client ID
+    clientSecret: String,             // required — your project's client secret
+    apiURL: URL,                      // default: https://api.openpanel.dev
+    maxRetries: Int,                  // default: 3
+    initialRetryDelay: Duration,      // default: 500ms (exponential backoff)
+    debug: Bool,                      // default: false — print diagnostics to console
+    maxQueueSize: Int,                // default: 1000 — FIFO eviction once exceeded
+    filter: (OpenPanelEvent) -> Bool  // optional — drop events before they leave the process
+)
+```
+
+`disabled` is **not** a `Config` field — it's a separate parameter on
+`initialize(_:disabled:)`. See "Deferred startup" below.
+
+## Deferred startup
+
+Use `disabled: true` on `initialize` to queue events until you've bootstrapped:
+
+```swift
+OpenPanel.initialize(.init(clientId: "...", clientSecret: "..."), disabled: true)
+OpenPanel.track("app_launch")   // queued in memory
+// ...later
+OpenPanel.ready()               // flushes the queue
+```
+
+## Filtering events
+
+Pass a `filter` closure to drop events before they hit the network:
+
+```swift
+OpenPanel.initialize(.init(
+    clientId: "...",
+    clientSecret: "...",
+    filter: { event in
+        if case let .track(payload) = event, payload.name == "noisy_event" {
+            return false
+        }
+        return true
+    }
 ))
 ```
 
-### Tracking Events
+## Tests
 
-To track an event:
+Tests use Swift Testing (requires Xcode 16 / Swift 6) and `URLProtocol`-based mocking —
+no network access required.
 
-```swift
-OpenPanel.track(name: "Button Clicked", properties: ["button_id": "submit_form"])
+```bash
+swift test
 ```
-
-### Identifying Users
-
-To identify a user:
-
-```swift
-OpenPanel.identify(payload: IdentifyPayload(
-  profileId: "user123",
-  firstName: "John",
-  lastName: "Doe",
-  email: "john@example.com",
-  properties: ["subscription": "premium"]
-))
-```
-
-### Setting Global Properties
-
-To set properties that will be sent with every event:
-
-```swift
-OpenPanel.setGlobalProperties([
-  "app_version": "1.0.2",
-  "environment": "production"
-])
-```
-
-### Creating Aliases
-
-To create an alias for a user:
-
-```swift
-OpenPanel.alias(payload: AliasPayload(profileId: "user123", alias: "u123"))
-```
-
-### Incrementing Properties
-
-To increment a numeric property:
-
-```swift
-OpenPanel.increment(payload: IncrementPayload(profileId: "user123", property: "login_count"))
-```
-
-### Decrementing Properties
-
-To decrement a numeric property:
-
-```swift
-OpenPanel.decrement(payload: DecrementPayload(profileId: "user123", property: "credits_remaining"))
-```
-
-## Advanced Usage
-
-### Disabling Tracking
-
-You can temporarily disable tracking during initialization:
-
-```swift
-OpenPanel.initialize(options: .init(
-  clientId: "YOUR_CLIENT_ID",
-  clientSecret: "YOUR_CLIENT_SECRET",
-  disabled: true
-))
-```
-
-### Custom Event Filtering
-
-You can set up custom event filtering during initialization:
-
-```swift
-OpenPanel.initialize(options: .init(
-  clientId: "YOUR_CLIENT_ID",
-  clientSecret: "YOUR_CLIENT_SECRET",
-  filter: { payload in
-    // Your custom filtering logic here
-    return true // or false to filter out the event
-  }
-))
-```
-
-## Thread Safety
-
-The OpenPanel SDK is designed to be thread-safe. You can call its methods from any thread without additional synchronization.
