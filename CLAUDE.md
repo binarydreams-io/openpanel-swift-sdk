@@ -1,44 +1,68 @@
-# CLAUDE.md
+# OpenPanel Swift SDK
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Zero-dependency Swift SDK for OpenPanel analytics. Talks to `POST /track` on
+`api.openpanel.dev`. Behavior mirrors the JS SDK — parity is intentional,
+verify against `openapi.json` before changing wire format.
 
-## Project Overview
-
-OpenPanel Swift SDK — an analytics SDK for Apple platforms (iOS 13+, macOS 10.15+, tvOS 15+). Licensed under AGPL-3.0.
-
-## Build Commands
+## Commands
 
 ```bash
-# Build for all platforms
 swift build
-
-# Build for a specific platform (useful since UIKit/AppKit code is conditionally compiled)
-xcodebuild -scheme OpenPanel -destination 'platform=iOS Simulator,name=iPhone 16'
-xcodebuild -scheme OpenPanel -destination 'platform=macOS'
-xcodebuild -scheme OpenPanel -destination 'platform=tvOS Simulator,name=Apple TV'
+swift test                      # Swift Testing (not XCTest); requires Swift 6 / Xcode 16
+swift package clean
 ```
 
-There are no tests or linting configured in this project.
+No `.xcodeproj` — SwiftPM only. CI builds on iOS / macOS / tvOS.
+
+## Public API shape
+
+`OpenPanel` is a shared singleton (`public static let shared`). `init` is
+private; callers interact through the static facade:
+
+```swift
+await OpenPanel.initialize(config: …)   // required, once
+try await OpenPanel.track("e", …)       // all other methods
+```
+
+Every public method except `initialize` is `async throws` and throws
+`OpenPanel.Error.notInitialized` when called before `initialize`. Network/HTTP
+failures are still swallowed internally (only `.notInitialized` reaches the
+caller). `initialize` resets all cached state (profile, groups, global props,
+queue, device/session IDs) — a re-init is a hard reset.
+
+Instance methods on the actor mirror the static ones; the static versions just
+forward to `shared`. When adding a new public method, add both — keep the
+shapes in sync.
 
 ## Architecture
 
-Single-target Swift Package (`OpenPanel`) with no external dependencies.
+- `Sources/OpenPanel/OpenPanel.swift` — public `actor OpenPanel`, the entry point
+- `Sources/OpenPanel/OpenPanel+{Config,Error,SDK}.swift` — public nested types
+- `Sources/OpenPanel/Models/` — **public** request payloads (`TrackPayload`, `IdentifyPayload`, `GroupPayload`, …) plus `AnyCodable` / `ProfileId`
+- `Sources/OpenPanel/Internal/` — non-public: `Transport`, `TrackEnvelope`, `TrackResponse`
 
-### Source Layout
+When adding a type, decide public vs. internal first — that decides which folder it goes in.
 
-- `Sources/OpenPanel.swift` — Main SDK class. Singleton (`OpenPanel.shared`) with static convenience methods. All public API lives here: `initialize`, `track`, `identify`, `alias`, `increment`, `decrement`, `setGlobalProperties`, `clear`, `flush`, `ready`.
-- `Sources/Internal/API.swift` — HTTP client with async/await, exponential backoff retry (default 3 retries, 0.5s initial delay). Posts JSON to the OpenPanel API.
-- `Sources/Internal/DeviceInfo.swift` — Platform-specific device metadata collection using conditional compilation (`#if canImport(UIKit)`, `#if os(macOS)`, etc.).
-- `Sources/Models/Payloads.swift` — Request payload types and the `TrackHandlerPayload` enum that wraps all event types for encoding.
-- `Sources/Models/AnyCodable.swift` — Type-erased `Codable` wrapper enabling `[String: Any]` properties in the public API.
+## Conventions
 
-### Key Patterns
+- Public nested types live in `OpenPanel+<Name>.swift` extensions, not inside `OpenPanel.swift`.
+- `Properties` is `[String: AnyCodable]` — wrap values at the call site; do not accept `[String: Any]` in public API.
+- `swiftformat` is authoritative: 2-space indent, `--wraparguments before-first`, `--self init-only`. Run before committing.
 
-- **Thread safety**: `@unchecked Sendable` conformance. Global properties protected by a concurrent `DispatchQueue` with barrier writes. API calls serialized via an `OperationQueue` (max 1 concurrent).
-- **Event queuing**: When `waitForProfile` is enabled, events queue until `identify()` or `ready()` is called, then flush.
-- **Property merging**: Device info → global properties → per-event properties (later overrides earlier).
-- **Conditional compilation**: Platform-specific blocks for iOS/tvOS (UIKit), macOS (AppKit), and tvOS-specific uname() calls. Be careful editing `DeviceInfo.swift` — each platform path must compile independently.
+## Gotchas
 
-### Swift Version
+- **Tests share `MockURLProtocol.registry`.** All test suites must be nested inside `MockBackedSuite` (which is `@Suite(.serialized)`). A top-level `@Suite` will run in parallel and clobber the handler registry.
+- **401 is a silent drop, no retry.** This matches the JS SDK — do not "fix" it by throwing.
+- **`"Duplicate event"` plain-text body on 200 = success with no body.** Transport sniffs the prefix; don't tighten the decoder.
+- **`identify` with only a `profileId` does not hit the network** — it just sets local state and flushes the queue. Extras (`email`, `firstName`, `properties`, …) are required to trigger a request.
+- **`revenue` is a `track` event** named `"revenue"` with reserved `__revenue` / `__deviceId` properties, not a separate endpoint.
+- **Queued events are stamped with `__timestamp`** so the server sees the original time, not the flush time. Preserve this when touching `send`/`flush`.
+- **Queue is in-memory only** — lost on app restart. Don't add persistence without discussion; the JS SDK behaves the same way.
 
-Package uses swift-tools-version 6.2 with strict concurrency. The main class is `final class OpenPanel: @unchecked Sendable`.
+## Testing
+
+- Framework: Swift Testing (`import Testing`, `@Test`, `#expect`).
+- Network is stubbed via `MockURLProtocol` + `URLSessionConfiguration.ephemeral` — tests never hit the real network.
+- New suite → `extension MockBackedSuite { @Suite("Name") struct MyTests { … } }`.
+- `MockURLProtocol.install { req in .success(.ok()) }` at the top of each test; `.reset()` is not needed because `install` resets captured state.
+- Singleton state persists across tests. Each test must call `OpenPanel.initialize(…)` (which resets state) before exercising the API. To assert pre-init behaviour, call `await OpenPanel.shared.resetForTesting()` — `internal`, reachable only via `@testable import OpenPanel`.
