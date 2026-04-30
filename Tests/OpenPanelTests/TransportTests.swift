@@ -11,7 +11,8 @@ import os
 import Testing
 
 extension MockBackedSuite {
-  @Suite("Transport") // MockURLProtocol uses shared registry; serialized via parent.
+  // MockURLProtocol uses a shared registry; serialization is inherited from MockBackedSuite.
+  @Suite("Transport", .tags(.networking, .transport))
   struct TransportTests {
     private func makeTransport(maxRetries: Int = 3) -> OpenPanel.Transport {
       let config = OpenPanel.Config(
@@ -24,34 +25,50 @@ extension MockBackedSuite {
       return OpenPanel.Transport(config: config, session: MockURLProtocol.makeSession())
     }
 
+    /// Convenience: a minimal track envelope used as the request body across most tests.
+    private func sampleEnvelope(name: String = "e") -> OpenPanelEvent {
+      .track(TrackPayload(name: name))
+    }
+
     // MARK: - Happy path
 
     @Test
-    func `200 OK returns decoded response and caches device/session IDs`() async throws {
+    func `200 OK returns decoded response and caches device-session IDs`() async throws {
       await MockURLProtocol.install { _ in .success(.ok(deviceId: "dev_42", sessionId: "ses_9")) }
 
       let transport = makeTransport()
-      let body = OpenPanelEvent.track(TrackPayload(name: "e"))
-      let response: TrackResponse? = try await transport.post(path: "/track", body: body)
+      let response: TrackResponse? = try await transport.post(path: "/track", body: sampleEnvelope())
 
       #expect(response?.deviceId == "dev_42")
       #expect(response?.sessionId == "ses_9")
     }
 
-    @Test
-    func `request includes auth and SDK headers`() async throws {
+    @Test(arguments: [
+      ("openpanel-client-id", "00000000-0000-0000-0000-000000000000"),
+      ("openpanel-client-secret", "test-secret"),
+      ("Content-Type", "application/json")
+    ])
+    func `request includes expected static header`(name: String, expected: String) async throws {
       await MockURLProtocol.install { _ in .success(.ok()) }
 
       let transport = makeTransport()
-      let _: TrackResponse? = try await transport.post(path: "/track", body: OpenPanelEvent.track(TrackPayload(name: "e")))
+      let _: TrackResponse? = try await transport.post(path: "/track", body: sampleEnvelope())
 
-      let captured = await MockURLProtocol.registry.requests
-      let request = try #require(captured.first)
-      #expect(request.value(forHTTPHeaderField: "openpanel-client-id") == "00000000-0000-0000-0000-000000000000")
-      #expect(request.value(forHTTPHeaderField: "openpanel-client-secret") == "test-secret")
-      #expect(request.value(forHTTPHeaderField: "openpanel-sdk-name") != nil)
-      #expect(request.value(forHTTPHeaderField: "openpanel-sdk-version") != nil)
-      #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+      let request = try await firstRequest()
+      #expect(request.value(forHTTPHeaderField: name) == expected)
+    }
+
+    @Test(arguments: ["openpanel-sdk-name", "openpanel-sdk-version"])
+    func `request includes non-empty SDK header`(name: String) async throws {
+      await MockURLProtocol.install { _ in .success(.ok()) }
+
+      let transport = makeTransport()
+      let _: TrackResponse? = try await transport.post(path: "/track", body: sampleEnvelope())
+
+      let request = try await firstRequest()
+      let value = request.value(forHTTPHeaderField: name)
+      #expect(value != nil)
+      #expect(value?.isEmpty == false)
     }
 
     @Test
@@ -59,7 +76,7 @@ extension MockBackedSuite {
       await MockURLProtocol.install { _ in .success(.noContent) }
 
       let transport = makeTransport()
-      let response: TrackResponse? = try await transport.post(path: "/track", body: OpenPanelEvent.track(TrackPayload(name: "e")))
+      let response: TrackResponse? = try await transport.post(path: "/track", body: sampleEnvelope())
       #expect(response == nil)
     }
 
@@ -70,7 +87,7 @@ extension MockBackedSuite {
       await MockURLProtocol.install { _ in .success(.unauthorized) }
 
       let transport = makeTransport(maxRetries: 5)
-      let response: TrackResponse? = try await transport.post(path: "/track", body: OpenPanelEvent.track(TrackPayload(name: "e")))
+      let response: TrackResponse? = try await transport.post(path: "/track", body: sampleEnvelope())
       #expect(response == nil)
 
       let calls = await MockURLProtocol.registry.requests.count
@@ -84,12 +101,20 @@ extension MockBackedSuite {
       await MockURLProtocol.install { _ in .success(.serverError) }
 
       let transport = makeTransport(maxRetries: 3)
-      await #expect(throws: OpenPanel.Error.self) {
-        let _: TrackResponse? = try await transport.post(path: "/track", body: OpenPanelEvent.track(TrackPayload(name: "e")))
+      let error = await #expect(throws: OpenPanel.Error.self) {
+        let _: TrackResponse? = try await transport.post(path: "/track", body: sampleEnvelope())
       }
+
       // initial + 3 retries = 4 calls
       let calls = await MockURLProtocol.registry.requests.count
       #expect(calls == 4)
+
+      // The thrown error must surface the upstream HTTP status, not a generic transport error.
+      guard case let .http(status, _) = try #require(error) else {
+        Issue.record("expected OpenPanel.Error.http, got \(String(describing: error))")
+        return
+      }
+      #expect(status == 500)
     }
 
     @Test
@@ -102,7 +127,7 @@ extension MockBackedSuite {
       }
 
       let transport = makeTransport(maxRetries: 3)
-      let response: TrackResponse? = try await transport.post(path: "/track", body: OpenPanelEvent.track(TrackPayload(name: "e")))
+      let response: TrackResponse? = try await transport.post(path: "/track", body: sampleEnvelope())
 
       #expect(response?.deviceId == "ok")
       let calls = await MockURLProtocol.registry.requests.count
@@ -118,7 +143,7 @@ extension MockBackedSuite {
       }
 
       let transport = makeTransport(maxRetries: 2)
-      let response: TrackResponse? = try await transport.post(path: "/track", body: OpenPanelEvent.track(TrackPayload(name: "e")))
+      let response: TrackResponse? = try await transport.post(path: "/track", body: sampleEnvelope())
       #expect(response != nil)
 
       let calls = await MockURLProtocol.registry.requests.count
@@ -128,11 +153,11 @@ extension MockBackedSuite {
     // MARK: - Plain-text "Duplicate event"
 
     @Test
-    func `200 with plain-text 'Duplicate event' returns nil, no decoding error`() async throws {
+    func `200 with plain-text Duplicate event body returns nil without decoding error`() async throws {
       await MockURLProtocol.install { _ in .success(.duplicate) }
 
       let transport = makeTransport()
-      let response: TrackResponse? = try await transport.post(path: "/track", body: OpenPanelEvent.track(TrackPayload(name: "e")))
+      let response: TrackResponse? = try await transport.post(path: "/track", body: sampleEnvelope())
       #expect(response == nil)
     }
 
@@ -146,11 +171,21 @@ extension MockBackedSuite {
       let body = OpenPanelEvent.track(TrackPayload(name: "screen_view", profileId: "u1"))
       let _: TrackResponse? = try await transport.post(path: "/track", body: body)
 
-      let bodies = await MockURLProtocol.registry.bodies
-      let raw = try #require(bodies.first)
-      let json = String(decoding: raw, as: UTF8.self)
-      #expect(json.contains("\"type\":\"track\"") || json.contains("\"type\": \"track\""))
-      #expect(json.contains("\"name\":\"screen_view\"") || json.contains("\"name\": \"screen_view\""))
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      guard let track = envelope.trackPayload else {
+        Issue.record("expected track envelope, got \(envelope.testDescription)")
+        return
+      }
+      #expect(track.name == "screen_view")
+      #expect(track.profileId == "u1")
+    }
+
+    // MARK: - Helpers
+
+    /// Returns the first captured `URLRequest`, or fails the test with proper source attribution.
+    private func firstRequest(sourceLocation: SourceLocation = #_sourceLocation) async throws -> URLRequest {
+      let captured = await MockURLProtocol.registry.requests
+      return try #require(captured.first, sourceLocation: sourceLocation)
     }
   }
 }

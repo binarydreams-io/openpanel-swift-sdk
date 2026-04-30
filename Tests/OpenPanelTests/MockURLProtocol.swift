@@ -20,7 +20,7 @@ import os
 final class MockURLProtocol: URLProtocol, @unchecked Sendable {
   // MARK: - Handler registry
 
-  struct Response {
+  struct Response: Sendable {
     var statusCode: Int
     var body: Data
     var headers: [String: String]

@@ -9,48 +9,14 @@ import Foundation
 @testable import OpenPanel
 import Testing
 
+// MARK: - Track
+
 extension MockBackedSuite {
-  @Suite("OpenPanel")
-  struct OpenPanelTests {
-    /// Re-initialize the shared singleton with a fresh mocked session. `initialize`
-    /// resets all cached state so tests don't leak into each other via the singleton.
-    private func configure(
-      disabled: Bool = false,
-      clientSecret: String = "test-secret",
-      filter: (@Sendable (OpenPanelEvent) -> Bool)? = nil
-    ) async {
-      let config = OpenPanel.Config(
-        clientId: "00000000-0000-0000-0000-000000000000",
-        clientSecret: clientSecret,
-        apiURL: URL(string: "https://api.example.test")!,
-        initialRetryDelay: .milliseconds(1),
-        filter: filter
-      )
-      await OpenPanel.shared.initialize(config, session: MockURLProtocol.makeSession(), disabled: disabled)
-    }
-
-    // MARK: - Queue behaviour
-
-    @Test
-    func `disabled=true queues events until ready()`() async {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure(disabled: true)
-
-      await OpenPanel.shared.track("a")
-      await OpenPanel.shared.track("b")
-
-      #expect(await MockURLProtocol.registry.requests.isEmpty)
-
-      await OpenPanel.shared.ready()
-
-      let calls = await MockURLProtocol.registry.requests.count
-      #expect(calls == 2)
-    }
-
-    @Test
-    func `server deviceId/sessionId are cached on the actor`() async {
+  @Suite("Track", .tags(.networking))
+  struct TrackTests {
+    @Test(.configured)
+    func `server deviceId/sessionId are cached on the actor`() async throws {
       await MockURLProtocol.install { _ in .success(.ok(deviceId: "d_abc", sessionId: "s_xyz")) }
-      await configure()
 
       await OpenPanel.shared.track("e")
 
@@ -58,178 +24,297 @@ extension MockBackedSuite {
       #expect(await OpenPanel.sessionId == "s_xyz")
     }
 
-    // MARK: - Global properties
+    @Test(.configured)
+    func `subsequent track events inherit identified profileId`() async throws {
+      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
+      await OpenPanel.shared.track("e")
 
-    @Test
-    func `global properties are merged into every track event`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      #expect(payload.name == "e")
+      #expect(payload.profileId == .string("u1"))
+    }
+  }
+}
 
-      await OpenPanel.shared.setGlobalProperties(["app_version": "1.2.3"])
-      await OpenPanel.shared.track("e", properties: ["screen": "Home"])
+// MARK: - Identify
 
-      let body = try await firstBodyJSON()
-      #expect(body.contains("\"app_version\":\"1.2.3\""))
-      #expect(body.contains("\"screen\":\"Home\""))
+extension MockBackedSuite {
+  @Suite("Identify", .tags(.networking, .identify))
+  struct IdentifyTests {
+    @Test(.configured)
+    func `identify with only profileId does NOT hit the server`() async {
+      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
+
+      let count = await MockURLProtocol.registry.requests.count
+      #expect(count == 0)
     }
 
-    @Test
-    func `event-level properties override global properties on key collision`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
+    @Test(.configured)
+    func `identify with extras sends an identify envelope`() async throws {
+      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1", email: "a@b.c"))
 
-      await OpenPanel.shared.setGlobalProperties(["env": "prod"])
-      await OpenPanel.shared.track("e", properties: ["env": "staging"])
-
-      let body = try await firstBodyJSON()
-      #expect(body.contains("\"env\":\"staging\""))
-      #expect(!body.contains("\"env\":\"prod\""))
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.identifyPayload)
+      #expect(payload.profileId == .string("u1"))
+      #expect(payload.email == "a@b.c")
     }
 
-    // MARK: - Groups
+    @Test(.configured(disabled: true))
+    func `identify does not flush while disabled=true`() async {
+      await OpenPanel.shared.track("queued")
 
-    @Test
+      // identify attempts to drain, but disabled is still true — queue stays.
+      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
+      let beforeReady = await MockURLProtocol.registry.requests.count
+      #expect(beforeReady == 0)
+
+      await OpenPanel.shared.ready()
+      let afterReady = await MockURLProtocol.registry.requests.count
+      #expect(afterReady == 1)
+    }
+  }
+}
+
+// MARK: - Groups
+
+extension MockBackedSuite {
+  @Suite("Groups", .tags(.networking, .groups))
+  struct GroupTests {
+    @Test(.configured)
     func `setGroup accumulates groups and attaches them to subsequent events`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
-
       // setGroup requires a profileId to send assign_group events.
       await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
       await OpenPanel.shared.setGroup("acme")
       await OpenPanel.shared.setGroup("globex")
       await OpenPanel.shared.track("e")
 
-      let bodies = await MockURLProtocol.registry.bodies
+      let envelopes = try await MockURLProtocol.registry.envelopes()
       // 2 assign_group + 1 track = 3 requests
-      #expect(bodies.count == 3)
+      #expect(envelopes.count == 3)
 
-      let lastJSON = try String(decoding: #require(bodies.last), as: UTF8.self)
-      #expect(lastJSON.contains("\"type\":\"track\""))
-      #expect(lastJSON.contains("acme"))
-      #expect(lastJSON.contains("globex"))
+      let lastEnvelope = try #require(envelopes.last)
+      let trackPayload = try #require(lastEnvelope.trackPayload)
+      let groups = try #require(trackPayload.groups)
+      #expect(Set(groups) == ["acme", "globex"])
     }
 
-    @Test
-    func `setGroup without profileId is a no-op`() async {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
-
-      await OpenPanel.shared.setGroup("acme")
-
-      let calls = await MockURLProtocol.registry.requests.count
-      #expect(calls == 0)
-    }
-
-    @Test
+    @Test(.configured)
     func `setGroups assigns multiple groups at once`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
-
       await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
       await OpenPanel.shared.setGroups(["acme", "globex"])
       await OpenPanel.shared.track("e")
 
-      let bodies = await MockURLProtocol.registry.bodies
+      let envelopes = try await MockURLProtocol.registry.envelopes()
       // 1 assign_group + 1 track = 2 requests
-      #expect(bodies.count == 2)
+      #expect(envelopes.count == 2)
 
-      let lastJSON = try String(decoding: #require(bodies.last), as: UTF8.self)
-      #expect(lastJSON.contains("acme"))
-      #expect(lastJSON.contains("globex"))
+      let assign = try #require(envelopes.first?.assignGroupPayload)
+      #expect(Set(assign.groupIds) == ["acme", "globex"])
+      #expect(assign.profileId == .string("u1"))
+
+      let trackPayload = try #require(envelopes.last?.trackPayload)
+      let groups = try #require(trackPayload.groups)
+      #expect(Set(groups) == ["acme", "globex"])
     }
 
-    // MARK: - Identify
+    @Test(.configured)
+    func `upsertGroup sends group envelope`() async throws {
+      await OpenPanel.shared.upsertGroup(GroupPayload(id: "g1", type: "company", name: "Acme"))
 
-    @Test
-    func `identify with only profileId does NOT hit the server`() async {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
-
-      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
-
-      let calls = await MockURLProtocol.registry.requests.count
-      #expect(calls == 0)
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.groupPayload)
+      #expect(payload.id == "g1")
+      #expect(payload.type == "company")
+      #expect(payload.name == "Acme")
     }
+  }
+}
 
-    @Test
-    func `identify with extras sends an identify envelope`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
+// MARK: - Queue
 
-      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1", email: "a@b.c"))
+extension MockBackedSuite {
+  @Suite("Queue", .tags(.networking, .queue))
+  struct QueueTests {
+    @Test(.configured(disabled: true))
+    func `disabled=true queues events until ready()`() async {
+      await OpenPanel.shared.track("a")
+      await OpenPanel.shared.track("b")
 
-      let body = try await firstBodyJSON()
-      #expect(body.contains("\"type\":\"identify\""))
-      #expect(body.contains("\"email\":\"a@b.c\""))
-    }
-
-    @Test
-    func `identify does not flush while disabled=true`() async {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure(disabled: true)
-
-      await OpenPanel.shared.track("queued")
-
-      // identify attempts to drain, but disabled is still true — queue stays.
-      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
-      #expect(await MockURLProtocol.registry.requests.isEmpty)
+      let beforeReady = await MockURLProtocol.registry.requests.count
+      #expect(beforeReady == 0)
 
       await OpenPanel.shared.ready()
-      let calls = await MockURLProtocol.registry.requests.count
-      #expect(calls == 1)
+
+      let afterReady = await MockURLProtocol.registry.requests.count
+      #expect(afterReady == 2)
     }
 
-    @Test
-    func `subsequent track events inherit identified profileId`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
+    @Test(.configured(disabled: true))
+    func `flush() drains the queue when SDK is enabled`() async {
+      await OpenPanel.shared.track("a")
+      await OpenPanel.shared.track("b")
+      let beforeReady = await MockURLProtocol.registry.requests.count
+      #expect(beforeReady == 0)
 
-      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
-      await OpenPanel.shared.track("e")
+      // Enable, then flush is implicitly invoked by ready().
+      await OpenPanel.shared.ready()
 
-      let body = try await firstBodyJSON()
-      #expect(body.contains("\"profileId\":\"u1\""))
+      let afterReady = await MockURLProtocol.registry.requests.count
+      #expect(afterReady == 2)
     }
 
-    // MARK: - Revenue
+    @Test(.configured(disabled: true))
+    func `queued track events are stamped with __timestamp`() async throws {
+      await OpenPanel.shared.track("queued_event")
+      await OpenPanel.shared.ready()
 
-    @Test
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      let properties = try #require(payload.properties)
+      #expect(properties["__timestamp"] != nil)
+    }
+
+    @Test(.configured(disabled: true))
+    func `track events queued before identify pick up profileId on drain`() async throws {
+      await OpenPanel.shared.track("queued_before_identify")
+
+      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u_late"))
+      await OpenPanel.shared.ready()
+
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      #expect(payload.name == "queued_before_identify")
+      #expect(payload.profileId == .string("u_late"))
+    }
+  }
+}
+
+// MARK: - Revenue
+
+extension MockBackedSuite {
+  @Suite("Revenue", .tags(.networking))
+  struct RevenueTests {
+    @Test(.configured(clientSecret: "s"))
     func `revenue encodes __revenue and names the event 'revenue'`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure(clientSecret: "s")
-
       await OpenPanel.shared.revenue(9.99, properties: ["currency": "USD"])
 
-      let body = try await firstBodyJSON()
-      #expect(body.contains("\"name\":\"revenue\""))
-      #expect(body.contains("\"__revenue\":\"9.99\""))
-      #expect(body.contains("\"currency\":\"USD\""))
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      #expect(payload.name == "revenue")
+      let properties = try #require(payload.properties)
+      #expect(properties["__revenue"] == "9.99")
+      #expect(properties["currency"] == "USD")
     }
 
-    // MARK: - Filter
+    @Test(.configured(clientSecret: "s"))
+    func `revenue encodes __deviceId when provided`() async throws {
+      await OpenPanel.shared.revenue(100, deviceId: "dev_42")
 
-    @Test
-    func `filter=false drops the event before network`() async {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure(filter: { event in
-        if case let .track(p) = event, p.name == "blocked" { return false }
-        return true
-      })
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      let properties = try #require(payload.properties)
+      #expect(properties["__deviceId"] == "dev_42")
+      #expect(properties["__revenue"] == "100.0")
+    }
+  }
+}
 
-      await OpenPanel.shared.track("ok")
-      await OpenPanel.shared.track("blocked")
+// MARK: - Counters (increment / decrement)
 
-      let calls = await MockURLProtocol.registry.requests.count
-      #expect(calls == 1)
+extension MockBackedSuite {
+  @Suite("Counters", .tags(.networking))
+  struct CounterTests {
+    @Test(.configured)
+    func `increment sends increment envelope with profileId`() async throws {
+      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
+      await OpenPanel.shared.increment(property: "login_count", value: 1)
+
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.incrementPayload)
+      #expect(payload.property == "login_count")
+      #expect(payload.profileId == .string("u1"))
+      #expect(payload.value == 1)
     }
 
-    // MARK: - Clear
+    @Test(.configured)
+    func `decrement sends decrement envelope with profileId`() async throws {
+      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
+      await OpenPanel.shared.decrement(property: "credits", value: 5)
 
-    @Test
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.decrementPayload)
+      #expect(payload.property == "credits")
+      #expect(payload.profileId == .string("u1"))
+      #expect(payload.value == 5)
+    }
+  }
+}
+
+// MARK: - Methods that require a profileId
+
+extension MockBackedSuite {
+  @Suite("RequiresProfileId", .tags(.networking))
+  struct RequiresProfileIdTests {
+    @Test(.configured, arguments: [
+      "setGroup",
+      "setGroups",
+      "increment",
+      "decrement"
+    ])
+    func `methods that require profileId are no-ops without one`(method: String) async {
+      switch method {
+      case "setGroup": await OpenPanel.shared.setGroup("g")
+      case "setGroups": await OpenPanel.shared.setGroups(["g"])
+      case "increment": await OpenPanel.shared.increment(property: "p")
+      case "decrement": await OpenPanel.shared.decrement(property: "p")
+      default:
+        Issue.record("unknown method '\(method)'")
+        return
+      }
+      let count = await MockURLProtocol.registry.requests.count
+      #expect(count == 0, "\(method) must not hit the network without profileId")
+    }
+  }
+}
+
+// MARK: - Global properties
+
+extension MockBackedSuite {
+  @Suite("GlobalProperties", .tags(.networking))
+  struct GlobalPropertiesTests {
+    @Test(.configured)
+    func `global properties are merged into every track event`() async throws {
+      await OpenPanel.shared.setGlobalProperties(["app_version": "1.2.3"])
+      await OpenPanel.shared.track("e", properties: ["screen": "Home"])
+
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      let properties = try #require(payload.properties)
+      #expect(properties["app_version"] == "1.2.3")
+      #expect(properties["screen"] == "Home")
+    }
+
+    @Test(.configured)
+    func `event-level properties override global properties on key collision`() async throws {
+      await OpenPanel.shared.setGlobalProperties(["env": "prod"])
+      await OpenPanel.shared.track("e", properties: ["env": "staging"])
+
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      let properties = try #require(payload.properties)
+      #expect(properties["env"] == "staging")
+    }
+  }
+}
+
+// MARK: - Clear
+
+extension MockBackedSuite {
+  @Suite("Clear", .tags(.networking))
+  struct ClearTests {
+    @Test(.configured)
     func `clear() resets profile, groups, device/session IDs`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
-
       await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1", email: "a@b.c"))
       await OpenPanel.shared.track("e")
       #expect(await OpenPanel.deviceId != nil)
@@ -240,149 +325,42 @@ extension MockBackedSuite {
       #expect(await OpenPanel.sessionId == nil)
 
       await OpenPanel.shared.track("after")
-      let bodies = await MockURLProtocol.registry.bodies
-      let lastJSON = try String(decoding: #require(bodies.last), as: UTF8.self)
-      #expect(!lastJSON.contains("\"profileId\":\"u1\""))
+      let envelope = try await MockURLProtocol.registry.lastEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      #expect(payload.profileId == nil)
     }
 
-    // MARK: - Increment / Decrement
-
-    @Test
-    func `increment sends increment envelope with profileId`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
-
-      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
-      await OpenPanel.shared.increment(property: "login_count", value: 1)
-
-      let body = try await firstBodyJSON()
-      #expect(body.contains("\"type\":\"increment\""))
-      #expect(body.contains("\"property\":\"login_count\""))
-      #expect(body.contains("\"profileId\":\"u1\""))
-    }
-
-    @Test
-    func `increment without profileId is a no-op`() async {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
-
-      await OpenPanel.shared.increment(property: "x")
-
-      let calls = await MockURLProtocol.registry.requests.count
-      #expect(calls == 0)
-    }
-
-    @Test
-    func `decrement sends decrement envelope with profileId`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
-
-      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
-      await OpenPanel.shared.decrement(property: "credits", value: 5)
-
-      let body = try await firstBodyJSON()
-      #expect(body.contains("\"type\":\"decrement\""))
-      #expect(body.contains("\"property\":\"credits\""))
-    }
-
-    // MARK: - upsertGroup
-
-    @Test
-    func `upsertGroup sends group envelope`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
-
-      await OpenPanel.shared.upsertGroup(GroupPayload(id: "g1", type: "company", name: "Acme"))
-
-      let body = try await firstBodyJSON()
-      #expect(body.contains("\"type\":\"group\""))
-      #expect(body.contains("\"name\":\"Acme\""))
-    }
-
-    // MARK: - Flush
-
-    @Test
-    func `flush() drains the queue when SDK is enabled`() async {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure(disabled: true)
-
-      await OpenPanel.shared.track("a")
-      await OpenPanel.shared.track("b")
-      #expect(await MockURLProtocol.registry.requests.isEmpty)
-
-      // Enable, then flush explicitly.
-      await OpenPanel.shared.ready()
-
-      let calls = await MockURLProtocol.registry.requests.count
-      #expect(calls == 2)
-    }
-
-    // MARK: - Revenue with deviceId
-
-    @Test
-    func `revenue encodes __deviceId when provided`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure(clientSecret: "s")
-
-      await OpenPanel.shared.revenue(100, deviceId: "dev_42")
-
-      let body = try await firstBodyJSON()
-      #expect(body.contains("\"__deviceId\":\"dev_42\""))
-      #expect(body.contains("\"__revenue\":\"100.0\""))
-    }
-
-    // MARK: - Queued event timestamp
-
-    @Test
-    func `queued track events are stamped with __timestamp`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure(disabled: true)
-
-      await OpenPanel.shared.track("queued_event")
-      await OpenPanel.shared.ready()
-
-      let body = try await firstBodyJSON()
-      #expect(body.contains("\"__timestamp\""))
-    }
-
-    // MARK: - Queued events inherit profileId set after queueing
-
-    @Test
-    func `track events queued before identify pick up profileId on drain`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure(disabled: true)
-
-      await OpenPanel.shared.track("queued_before_identify")
-
-      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u_late"))
-      await OpenPanel.shared.ready()
-
-      let body = try await firstBodyJSON()
-      #expect(body.contains("\"profileId\":\"u_late\""))
-      #expect(body.contains("\"name\":\"queued_before_identify\""))
-    }
-
-    // MARK: - Clear preserves globals
-
-    @Test
+    @Test(.configured)
     func `clear() does not reset global properties`() async throws {
-      await MockURLProtocol.install { _ in .success(.ok()) }
-      await configure()
-
       await OpenPanel.shared.setGlobalProperties(["env": "prod"])
       await OpenPanel.shared.clear()
       await OpenPanel.shared.track("e")
 
-      let body = try await firstBodyJSON()
-      #expect(body.contains("\"env\":\"prod\""))
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      let properties = try #require(payload.properties)
+      #expect(properties["env"] == "prod")
     }
+  }
+}
 
-    // MARK: - Helpers
+// MARK: - Filter
 
-    private func firstBodyJSON() async throws -> String {
-      let bodies = await MockURLProtocol.registry.bodies
-      let raw = try #require(bodies.first)
-      return String(decoding: raw, as: UTF8.self)
+extension MockBackedSuite {
+  @Suite("Filter", .tags(.networking))
+  struct FilterTests {
+    @Test(.configured(filter: { event in
+      if case let .track(p) = event, p.name == "blocked" { return false }
+      return true
+    }))
+    func `filter=false drops the event before network`() async throws {
+      await OpenPanel.shared.track("ok")
+      await OpenPanel.shared.track("blocked")
+
+      let envelopes = try await MockURLProtocol.registry.envelopes()
+      #expect(envelopes.count == 1)
+      let payload = try #require(envelopes.first?.trackPayload)
+      #expect(payload.name == "ok")
     }
   }
 }
