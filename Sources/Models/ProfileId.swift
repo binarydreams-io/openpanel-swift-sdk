@@ -34,16 +34,16 @@ public enum ProfileId: Sendable, Hashable {
 extension ProfileId: Codable {
   public init(from decoder: Decoder) throws {
     let container = try decoder.singleValueContainer()
-    if let string = try? container.decode(String.self) {
-      self = .string(string)
+    if let stringValue = try? container.decode(String.self) {
+      self = .string(stringValue)
       return
     }
-    if let int = try? container.decode(Int64.self) {
-      self = .int(int)
+    if let intValue = try? container.decode(Int64.self) {
+      self = .int(intValue)
       return
     }
-    if let double = try? container.decode(Double.self) {
-      self = .double(double)
+    if let doubleValue = try? container.decode(Double.self) {
+      self = .double(doubleValue)
       return
     }
     throw DecodingError.dataCorruptedError(in: container, debugDescription: "ProfileId must be string or number")
@@ -52,9 +52,9 @@ extension ProfileId: Codable {
   public func encode(to encoder: Encoder) throws {
     var container = encoder.singleValueContainer()
     switch self {
-    case let .string(string): try container.encode(string)
-    case let .int(int): try container.encode(int)
-    case let .double(double): try container.encode(double)
+    case let .string(stringValue): try container.encode(stringValue)
+    case let .int(intValue): try container.encode(intValue)
+    case let .double(doubleValue): try container.encode(doubleValue)
     }
   }
 }

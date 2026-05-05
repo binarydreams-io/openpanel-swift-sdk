@@ -20,16 +20,16 @@ import os
 final class MockURLProtocol: URLProtocol, @unchecked Sendable {
   // MARK: - Handler registry
 
-  struct Response: Sendable {
+  struct Response {
     var statusCode: Int
     var body: Data
     var headers: [String: String]
 
     static func ok(deviceId: String = "dev_1", sessionId: String = "ses_1") -> Response {
-      let json = #"{"deviceId":"\#(deviceId)","sessionId":"\#(sessionId)"}"#
+      let bodyJSON = #"{"deviceId":"\#(deviceId)","sessionId":"\#(sessionId)"}"#
       return .init(
         statusCode: 200,
-        body: Data(json.utf8),
+        body: Data(bodyJSON.utf8),
         headers: ["Content-Type": "application/json"]
       )
     }
@@ -99,47 +99,47 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
   override func startLoading() {
     let request = request
     // URLSession puts uploaded body into httpBodyStream, not httpBody.
-    let body = Self.readBody(from: request)
+    let requestBody = Self.readBody(from: request)
 
-    let task = Task {
-      let result = await Self.registry.handle(request, body: body)
+    let loadingTask = Task {
+      let handlerResult = await Self.registry.handle(request, body: requestBody)
       guard !Task.isCancelled else { return }
-      switch result {
+      switch handlerResult {
       case let .success(response):
-        let http = HTTPURLResponse(
+        let httpResponse = HTTPURLResponse(
           url: request.url!,
           statusCode: response.statusCode,
           httpVersion: "HTTP/1.1",
           headerFields: response.headers
         )!
-        self.client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
+        self.client?.urlProtocol(self, didReceive: httpResponse, cacheStoragePolicy: .notAllowed)
         self.client?.urlProtocol(self, didLoad: response.body)
         self.client?.urlProtocolDidFinishLoading(self)
       case let .failure(error):
         self.client?.urlProtocol(self, didFailWithError: error)
       }
     }
-    loadTask.withLock { $0 = task }
+    loadTask.withLock { storedTask in storedTask = loadingTask }
   }
 
   override func stopLoading() {
-    loadTask.withLock { $0?.cancel() }
+    loadTask.withLock { storedTask in storedTask?.cancel() }
   }
 
   /// URLSession surfaces the request body via `httpBodyStream`.
   private static func readBody(from request: URLRequest) -> Data? {
-    if let body = request.httpBody { return body }
-    guard let stream = request.httpBodyStream else { return nil }
-    stream.open()
-    defer { stream.close() }
-    var data = Data()
-    let size = 4096
-    var buf = [UInt8](repeating: 0, count: size)
-    while stream.hasBytesAvailable {
-      let read = stream.read(&buf, maxLength: size)
-      if read <= 0 { break }
-      data.append(buf, count: read)
+    if let bodyData = request.httpBody { return bodyData }
+    guard let bodyStream = request.httpBodyStream else { return nil }
+    bodyStream.open()
+    defer { bodyStream.close() }
+    var collectedData = Data()
+    let bufferSize = 4096
+    var buffer = [UInt8](repeating: 0, count: bufferSize)
+    while bodyStream.hasBytesAvailable {
+      let bytesRead = bodyStream.read(&buffer, maxLength: bufferSize)
+      if bytesRead <= 0 { break }
+      collectedData.append(buffer, count: bytesRead)
     }
-    return data
+    return collectedData
   }
 }

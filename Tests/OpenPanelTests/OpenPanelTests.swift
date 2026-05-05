@@ -15,7 +15,7 @@ extension MockBackedSuite {
   @Suite("Track", .tags(.networking))
   struct TrackTests {
     @Test(.configured)
-    func `server deviceId/sessionId are cached on the actor`() async throws {
+    func `server deviceId/sessionId are cached on the actor`() async {
       await MockURLProtocol.install { _ in .success(.ok(deviceId: "d_abc", sessionId: "s_xyz")) }
 
       await OpenPanel.shared.track("e")
@@ -109,9 +109,9 @@ extension MockBackedSuite {
       // 1 assign_group + 1 track = 2 requests
       #expect(envelopes.count == 2)
 
-      let assign = try #require(envelopes.first?.assignGroupPayload)
-      #expect(Set(assign.groupIds) == ["acme", "globex"])
-      #expect(assign.profileId == .string("u1"))
+      let assignGroupPayload = try #require(envelopes.first?.assignGroupPayload)
+      #expect(Set(assignGroupPayload.groupIds) == ["acme", "globex"])
+      #expect(assignGroupPayload.profileId == .string("u1"))
 
       let trackPayload = try #require(envelopes.last?.trackPayload)
       let groups = try #require(trackPayload.groups)
@@ -256,24 +256,28 @@ extension MockBackedSuite {
 extension MockBackedSuite {
   @Suite("RequiresProfileId", .tags(.networking))
   struct RequiresProfileIdTests {
-    @Test(.configured, arguments: [
-      "setGroup",
-      "setGroups",
-      "increment",
-      "decrement"
-    ])
-    func `methods that require profileId are no-ops without one`(method: String) async {
-      switch method {
-      case "setGroup": await OpenPanel.shared.setGroup("g")
-      case "setGroups": await OpenPanel.shared.setGroups(["g"])
-      case "increment": await OpenPanel.shared.increment(property: "p")
-      case "decrement": await OpenPanel.shared.decrement(property: "p")
-      default:
-        Issue.record("unknown method '\(method)'")
-        return
-      }
-      let count = await MockURLProtocol.registry.requests.count
-      #expect(count == 0, "\(method) must not hit the network without profileId")
+    @Test(.configured)
+    func `setGroup is a no-op without profileId`() async {
+      await OpenPanel.shared.setGroup("g")
+      #expect(await MockURLProtocol.registry.requests.count == 0)
+    }
+
+    @Test(.configured)
+    func `setGroups is a no-op without profileId`() async {
+      await OpenPanel.shared.setGroups(["g"])
+      #expect(await MockURLProtocol.registry.requests.count == 0)
+    }
+
+    @Test(.configured)
+    func `increment is a no-op without profileId`() async {
+      await OpenPanel.shared.increment(property: "p")
+      #expect(await MockURLProtocol.registry.requests.count == 0)
+    }
+
+    @Test(.configured)
+    func `decrement is a no-op without profileId`() async {
+      await OpenPanel.shared.decrement(property: "p")
+      #expect(await MockURLProtocol.registry.requests.count == 0)
     }
   }
 }
@@ -317,7 +321,7 @@ extension MockBackedSuite {
     func `clear() resets profile, groups, device/session IDs`() async throws {
       await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1", email: "a@b.c"))
       await OpenPanel.shared.track("e")
-      #expect(await OpenPanel.deviceId != nil)
+      _ = try #require(await OpenPanel.deviceId)
 
       await OpenPanel.shared.clear()
 
@@ -340,6 +344,173 @@ extension MockBackedSuite {
       let payload = try #require(envelope.trackPayload)
       let properties = try #require(payload.properties)
       #expect(properties["env"] == "prod")
+    }
+  }
+}
+
+// MARK: - Reserved properties
+
+extension MockBackedSuite {
+  @Suite("ReservedProperties", .tags(.networking))
+  struct ReservedPropertiesTests {
+    @Test(.configured)
+    func `track stamps __brand, __osVersion, __model on every event`() async throws {
+      await OpenPanel.shared.track("e")
+
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      let properties = try #require(payload.properties)
+      #expect(properties["__brand"] == "Apple")
+      #expect(properties["__osVersion"]?.isEmpty == false)
+      #expect(properties["__model"]?.isEmpty == false)
+    }
+
+    @Test(.configured)
+    func `track stamps __os and __device so server doesn't fall back to desktop`() async throws {
+      await OpenPanel.shared.track("e")
+
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      let properties = try #require(payload.properties)
+      // On every supported test platform (iOS/macOS/tvOS) we resolve both keys; if either is
+      // missing, the OpenPanel server falls back to UA parsing and reports the event as desktop.
+      #expect(properties["__os"]?.isEmpty == false)
+      #expect(properties["__device"]?.isEmpty == false)
+      #if os(macOS) || targetEnvironment(macCatalyst)
+      #expect(properties["__os"] == "macOS")
+      #expect(properties["__device"] == "desktop")
+      #elseif os(iOS)
+      #expect(properties["__os"] == "iOS")
+      #expect(["mobile", "tablet"].contains(properties["__device"] ?? ""))
+      #elseif os(tvOS)
+      #expect(properties["__os"] == "tvOS")
+      #expect(properties["__device"] == "tv")
+      #endif
+    }
+
+    @Test(.configured)
+    func `track stamps screen metrics when available`() async throws {
+      await OpenPanel.shared.track("e")
+
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      let properties = try #require(payload.properties)
+      // Screen API is unavailable on Linux/headless tvOS-simulator-without-host;
+      // stamping is best-effort, so only assert when at least one key is present.
+      if properties["__screenWidth"] != nil {
+        let screenWidth = Int(properties["__screenWidth"] ?? "0") ?? 0
+        let screenHeight = Int(properties["__screenHeight"] ?? "0") ?? 0
+        let screenDpi = Int(properties["__screenDpi"] ?? "0") ?? 0
+        #expect(screenWidth > 0)
+        #expect(screenHeight > 0)
+        #expect(screenDpi > 0)
+      }
+    }
+
+    @Test(.configured)
+    func `caller-supplied __ keys are stripped from track properties`() async throws {
+      await OpenPanel.shared.track("e", properties: [
+        "__brand": "Hacker",
+        "__osVersion": "0",
+        "__model": "Pwned",
+        "__os": "Hackintosh",
+        "__device": "fridge",
+        "__custom": "x",
+        "screen": "Home"
+      ])
+
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      let properties = try #require(payload.properties)
+      #expect(properties["__brand"] == "Apple")
+      #expect(properties["__os"] != "Hackintosh")
+      #expect(properties["__device"] != "fridge")
+      #expect(properties["__custom"] == nil)
+      #expect(properties["screen"] == "Home")
+    }
+
+    @Test(.configured)
+    func `caller-supplied __ keys are stripped from global properties`() async throws {
+      await OpenPanel.shared.setGlobalProperties(["__brand": "Hacker", "env": "prod"])
+      await OpenPanel.shared.track("e")
+
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      let properties = try #require(payload.properties)
+      #expect(properties["__brand"] == "Apple")
+      #expect(properties["env"] == "prod")
+    }
+
+    @Test(.configured(clientSecret: "s"))
+    func `revenue still emits its own reserved properties alongside device metadata`() async throws {
+      await OpenPanel.shared.revenue(9.99, properties: ["__revenue": "0", "currency": "USD"], deviceId: "dev_1")
+
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      let properties = try #require(payload.properties)
+      #expect(properties["__revenue"] == "9.99")
+      #expect(properties["__deviceId"] == "dev_1")
+      #expect(properties["__brand"] == "Apple")
+      #expect(properties["currency"] == "USD")
+    }
+  }
+}
+
+// MARK: - Alias
+
+extension MockBackedSuite {
+  @Suite("Alias", .tags(.networking))
+  struct AliasTests {
+    @Test(.configured)
+    func `alias sends an alias envelope with both ids`() async throws {
+      await OpenPanel.shared.alias(profileId: "u_canonical", alias: "anon_42")
+
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.aliasPayload)
+      #expect(payload.profileId == "u_canonical")
+      #expect(payload.alias == "anon_42")
+    }
+  }
+}
+
+// MARK: - waitForProfile
+
+extension MockBackedSuite {
+  @Suite("WaitForProfile", .tags(.networking))
+  struct WaitForProfileTests {
+    @Test(.configured(waitForProfile: true))
+    func `events queue while waitForProfile is set and drain on identify`() async throws {
+      await OpenPanel.shared.track("before_login")
+
+      let beforeIdentify = await MockURLProtocol.registry.requests.count
+      #expect(beforeIdentify == 0)
+
+      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
+
+      let afterIdentify = await MockURLProtocol.registry.requests.count
+      #expect(afterIdentify == 1)
+
+      let envelope = try await MockURLProtocol.registry.firstEnvelope()
+      let payload = try #require(envelope.trackPayload)
+      #expect(payload.name == "before_login")
+      #expect(payload.profileId == .string("u1"))
+    }
+
+    @Test(.configured(waitForProfile: true))
+    func `clear() re-arms waitForProfile`() async {
+      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u1"))
+      await OpenPanel.shared.track("first")
+
+      await OpenPanel.shared.clear()
+      await OpenPanel.shared.track("queued_again")
+
+      let countAfterClear = await MockURLProtocol.registry.requests.count
+      #expect(countAfterClear == 1)
+
+      await OpenPanel.shared.identify(IdentifyPayload(profileId: "u2"))
+
+      let countAfterReIdentify = await MockURLProtocol.registry.requests.count
+      #expect(countAfterReIdentify == 2)
     }
   }
 }

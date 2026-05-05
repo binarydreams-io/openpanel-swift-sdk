@@ -27,12 +27,13 @@ struct EncodingTests {
     OpenPanelEvent.group(GroupPayload(id: "g", type: "company", name: "Acme")),
     OpenPanelEvent.assignGroup(AssignGroupPayload(groupIds: ["g"])),
     OpenPanelEvent.increment(IncrementPayload(profileId: "u", property: "x")),
-    OpenPanelEvent.decrement(DecrementPayload(profileId: "u", property: "x"))
+    OpenPanelEvent.decrement(DecrementPayload(profileId: "u", property: "x")),
+    OpenPanelEvent.alias(AliasPayload(profileId: "u_canonical", alias: "anon_42"))
   ])
   func `every envelope variant round-trips losslessly`(envelope: OpenPanelEvent) throws {
-    let data = try encoder.encode(envelope)
-    let decoded = try decoder.decode(OpenPanelEvent.self, from: data)
-    #expect(decoded == envelope)
+    let encodedData = try encoder.encode(envelope)
+    let decodedEnvelope = try decoder.decode(OpenPanelEvent.self, from: encodedData)
+    #expect(decodedEnvelope == envelope)
   }
 
   // MARK: - ProfileId union
@@ -44,15 +45,15 @@ struct EncodingTests {
   ])
   func `profileId encodes per its variant`(profileId: ProfileId, expectedFragment: String) throws {
     let envelope = OpenPanelEvent.identify(IdentifyPayload(profileId: profileId))
-    let json = try String(decoding: encoder.encode(envelope), as: UTF8.self)
-    #expect(json.contains(expectedFragment))
+    let encodedJSON = try String(decoding: encoder.encode(envelope), as: UTF8.self)
+    #expect(encodedJSON.contains(expectedFragment))
   }
 
   @Test
   func `numeric profileId is not quoted as a string`() throws {
     let envelope = OpenPanelEvent.identify(IdentifyPayload(profileId: .int(42)))
-    let json = try String(decoding: encoder.encode(envelope), as: UTF8.self)
-    #expect(json.contains("\"profileId\":\"42\"") == false)
+    let encodedJSON = try String(decoding: encoder.encode(envelope), as: UTF8.self)
+    #expect(encodedJSON.contains("\"profileId\":\"42\"") == false)
   }
 
   // MARK: - Optional omission
@@ -60,10 +61,10 @@ struct EncodingTests {
   @Test
   func `nil track fields are omitted, never emitted as null`() throws {
     let envelope = OpenPanelEvent.track(TrackPayload(name: "e"))
-    let json = try String(decoding: encoder.encode(envelope), as: UTF8.self)
-    #expect(json.contains("\"groups\"") == false)
-    #expect(json.contains("\"properties\"") == false)
-    #expect(json.contains("\"profileId\"") == false)
-    #expect(json.contains("null") == false)
+    let encodedJSON = try String(decoding: encoder.encode(envelope), as: UTF8.self)
+    #expect(encodedJSON.contains("\"groups\"") == false)
+    #expect(encodedJSON.contains("\"properties\"") == false)
+    #expect(encodedJSON.contains("\"profileId\"") == false)
+    #expect(encodedJSON.contains("null") == false)
   }
 }

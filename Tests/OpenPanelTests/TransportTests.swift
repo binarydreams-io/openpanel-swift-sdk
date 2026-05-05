@@ -11,7 +11,7 @@ import os
 import Testing
 
 extension MockBackedSuite {
-  // MockURLProtocol uses a shared registry; serialization is inherited from MockBackedSuite.
+  /// MockURLProtocol uses a shared registry; serialization is inherited from MockBackedSuite.
   @Suite("Transport", .tags(.networking, .transport))
   struct TransportTests {
     private func makeTransport(maxRetries: Int = 3) -> OpenPanel.Transport {
@@ -172,10 +172,7 @@ extension MockBackedSuite {
       let _: TrackResponse? = try await transport.post(path: "/track", body: body)
 
       let envelope = try await MockURLProtocol.registry.firstEnvelope()
-      guard let track = envelope.trackPayload else {
-        Issue.record("expected track envelope, got \(envelope.testDescription)")
-        return
-      }
+      let track = try #require(envelope.trackPayload)
       #expect(track.name == "screen_view")
       #expect(track.profileId == "u1")
     }

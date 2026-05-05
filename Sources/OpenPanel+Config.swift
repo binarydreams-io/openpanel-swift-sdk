@@ -20,28 +20,20 @@ public extension OpenPanel {
     public var maxRetries: Int
     /// Backoff delay for the first retry; each subsequent retry doubles the delay (exponential).
     public var initialRetryDelay: Duration
-    /// When `true`, the SDK prints diagnostics through `OSLog`.
-    public var debug: Bool
     /// Maximum number of events kept in the in-memory queue while the SDK is paused.
     /// When the cap is reached, the oldest event is dropped (FIFO eviction).
     public var maxQueueSize: Int
+    /// When `true`, all events are queued in memory until ``OpenPanel/identify(_:)``
+    /// supplies a `profileId`, at which point the queue is drained automatically.
+    /// Independent of the `disabled` flag — both must be cleared for events to send.
+    public var waitForProfile: Bool
     /// Optional filter: return `false` to drop an event before it leaves the process.
     public var filter: (@Sendable (OpenPanelEvent) -> Bool)?
+    /// When `true`, the SDK prints diagnostics through `OSLog`.
+    public var debug: Bool
 
     var sdkName: String {
-      #if os(iOS)
-      "swift-ios"
-      #elseif os(macOS)
-      "swift-macos"
-      #elseif os(tvOS)
-      "swift-tvos"
-      #elseif os(watchOS)
-      "swift-watchos"
-      #elseif os(visionOS)
-      "swift-visionos"
-      #else
       "swift"
-      #endif
     }
 
     var sdkVersion: String {
@@ -54,18 +46,20 @@ public extension OpenPanel {
       apiURL: URL = URL(string: "https://api.openpanel.dev")!,
       maxRetries: Int = 3,
       initialRetryDelay: Duration = .milliseconds(500),
-      debug: Bool = false,
       maxQueueSize: Int = 1000,
-      filter: (@Sendable (OpenPanelEvent) -> Bool)? = nil
+      waitForProfile: Bool = false,
+      filter: (@Sendable (OpenPanelEvent) -> Bool)? = nil,
+      debug: Bool = false
     ) {
       self.clientId = clientId
       self.clientSecret = clientSecret
       self.apiURL = apiURL
       self.maxRetries = maxRetries
       self.initialRetryDelay = initialRetryDelay
-      self.debug = debug
       self.maxQueueSize = maxQueueSize
+      self.waitForProfile = waitForProfile
       self.filter = filter
+      self.debug = debug
     }
   }
 }

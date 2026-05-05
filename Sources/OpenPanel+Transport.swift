@@ -28,14 +28,13 @@ extension OpenPanel {
       self.session = session
     }
 
-    func post<Res: Decodable>(path: String, body: some Encodable) async throws -> Res? {
-      let url = makeURL(path: path)
+    func post<Response: Decodable>(path: String, body: some Encodable) async throws -> Response? {
+      let requestURL = makeURL(path: path)
+      let encodedBody = try Self.encoder.encode(body)
 
-      let data = try Self.encoder.encode(body)
-
-      var request = URLRequest(url: url)
+      var request = URLRequest(url: requestURL)
       request.httpMethod = "POST"
-      request.httpBody = data
+      request.httpBody = encodedBody
       applyHeaders(&request)
 
       return try await send(request: request, attempt: 0)
@@ -46,12 +45,12 @@ extension OpenPanel {
     /// Joins `apiURL` with `path` regardless of whether either side has leading/trailing
     /// slashes. Preserves any base-path prefix in `apiURL` (e.g. proxy mounted at `/openpanel`).
     private func makeURL(path: String) -> URL {
-      var components = URLComponents(url: config.apiURL, resolvingAgainstBaseURL: true) ?? URLComponents()
-      let segments = [components.path, path]
+      var urlComponents = URLComponents(url: config.apiURL, resolvingAgainstBaseURL: true) ?? URLComponents()
+      let pathSegments = [urlComponents.path, path]
         .flatMap { $0.split(separator: "/") }
         .map(String.init)
-      components.path = "/" + segments.joined(separator: "/")
-      return components.url ?? config.apiURL
+      urlComponents.path = "/" + pathSegments.joined(separator: "/")
+      return urlComponents.url ?? config.apiURL
     }
 
     private func applyHeaders(_ request: inout URLRequest) {
@@ -62,19 +61,23 @@ extension OpenPanel {
       request.setValue(config.sdkVersion, forHTTPHeaderField: "openpanel-sdk-version")
     }
 
-    private func send<Res: Decodable>(request: URLRequest, attempt: Int) async throws -> Res? {
+    private func send<Response: Decodable>(request: URLRequest, attempt: Int) async throws -> Response? {
       do {
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw OpenPanel.Error.invalidResponse }
+        let (responseData, urlResponse) = try await session.data(for: request)
+        guard let httpResponse = urlResponse as? HTTPURLResponse else { throw OpenPanel.Error.invalidResponse }
 
-        switch http.statusCode {
+        switch httpResponse.statusCode {
         case 200, 202:
-          guard !data.isEmpty else { return nil }
+          guard !responseData.isEmpty else { return nil }
           // Server may return plain text `"Duplicate event"` with 200 — treat as success-with-no-body.
-          if let text = String(data: data, encoding: .utf8), !text.hasPrefix("\""), !text.hasPrefix("{"), !text.hasPrefix("[") {
+          if let responseText = String(data: responseData, encoding: .utf8),
+             !responseText.hasPrefix("\""),
+             !responseText.hasPrefix("{"),
+             !responseText.hasPrefix("[")
+          {
             return nil
           }
-          return try Self.decoder.decode(Res.self, from: data)
+          return try Self.decoder.decode(Response.self, from: responseData)
 
         case 401:
           // Unauthorized — silent drop, no retry.
@@ -82,17 +85,17 @@ extension OpenPanel {
           return nil
 
         default:
-          let body = String(data: data, encoding: .utf8)
-          throw OpenPanel.Error.http(status: http.statusCode, body: body)
+          let responseBody = String(data: responseData, encoding: .utf8)
+          throw OpenPanel.Error.http(status: httpResponse.statusCode, body: responseBody)
         }
       } catch is CancellationError {
         throw CancellationError()
       } catch {
         if attempt < config.maxRetries, isRetryable(error) {
           // Cap the shift to avoid overflow if a caller passes an unreasonable maxRetries.
-          let multiplier = 1 << min(attempt, 16)
-          let delay = config.initialRetryDelay * multiplier
-          try await Task.sleep(for: delay)
+          let backoffMultiplier = 1 << min(attempt, 16)
+          let backoffDelay = config.initialRetryDelay * backoffMultiplier
+          try await Task.sleep(for: backoffDelay)
           return try await send(request: request, attempt: attempt + 1)
         }
         if let openPanelError = error as? OpenPanel.Error { throw openPanelError }
@@ -102,8 +105,8 @@ extension OpenPanel {
 
     private func log(_ message: @autoclosure () -> String) {
       guard config.debug else { return }
-      let text = message()
-      OpenPanel.transportLog.debug("\(text)")
+      let formattedMessage = message()
+      OpenPanel.transportLog.debug("\(formattedMessage)")
     }
 
     /// Retries 5xx, 408, 429, and recoverable network conditions. DNS failures, refused

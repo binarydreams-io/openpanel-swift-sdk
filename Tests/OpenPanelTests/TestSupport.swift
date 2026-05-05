@@ -14,8 +14,9 @@ import Testing
 /// Test scope that resets the `OpenPanel.shared` singleton with a mock-backed session
 /// before each test/case and installs a default `200 OK` response. Removes the
 /// `await configure()` boilerplate that every legacy test used to repeat.
-struct ConfiguredOpenPanel: TestTrait, TestScoping, Sendable {
+struct ConfiguredOpenPanel: TestTrait, TestScoping {
   let disabled: Bool
+  let waitForProfile: Bool
   let clientSecret: String
   let filter: (@Sendable (OpenPanelEvent) -> Bool)?
   let response: MockURLProtocol.Response?
@@ -33,6 +34,7 @@ struct ConfiguredOpenPanel: TestTrait, TestScoping, Sendable {
       clientSecret: clientSecret,
       apiURL: URL(string: "https://api.example.test")!,
       initialRetryDelay: .milliseconds(1),
+      waitForProfile: waitForProfile,
       filter: filter
     )
     await OpenPanel.shared.initialize(config, session: MockURLProtocol.makeSession(), disabled: disabled)
@@ -43,16 +45,23 @@ struct ConfiguredOpenPanel: TestTrait, TestScoping, Sendable {
 extension Trait where Self == ConfiguredOpenPanel {
   /// Reset SDK with default `200 OK` mock response.
   static var configured: Self {
-    ConfiguredOpenPanel(disabled: false, clientSecret: "test-secret", filter: nil, response: .ok())
+    ConfiguredOpenPanel(disabled: false, waitForProfile: false, clientSecret: "test-secret", filter: nil, response: .ok())
   }
 
   static func configured(
     disabled: Bool = false,
+    waitForProfile: Bool = false,
     clientSecret: String = "test-secret",
     filter: (@Sendable (OpenPanelEvent) -> Bool)? = nil,
     response: MockURLProtocol.Response? = .ok()
   ) -> Self {
-    ConfiguredOpenPanel(disabled: disabled, clientSecret: clientSecret, filter: filter, response: response)
+    ConfiguredOpenPanel(
+      disabled: disabled,
+      waitForProfile: waitForProfile,
+      clientSecret: clientSecret,
+      filter: filter,
+      response: response
+    )
   }
 }
 
@@ -60,29 +69,29 @@ extension Trait where Self == ConfiguredOpenPanel {
 
 extension MockURLProtocol.Registry {
   /// Decode all captured request bodies into `OpenPanelEvent` envelopes.
-  func envelopes(sourceLocation: SourceLocation = #_sourceLocation) throws -> [OpenPanelEvent] {
-    let captured = bodies
+  func envelopes() throws -> [OpenPanelEvent] {
+    let capturedBodies = bodies
     let decoder = JSONDecoder()
-    return try captured.map { raw in
+    return try capturedBodies.map { rawBody in
       do {
-        return try decoder.decode(OpenPanelEvent.self, from: raw)
+        return try decoder.decode(OpenPanelEvent.self, from: rawBody)
       } catch {
-        Issue.record("Could not decode envelope: \(error). Raw: \(String(decoding: raw, as: UTF8.self))", sourceLocation: sourceLocation)
+        Attachment.record(rawBody, named: "raw-body")
         throw error
       }
     }
   }
 
   func firstEnvelope(sourceLocation: SourceLocation = #_sourceLocation) throws -> OpenPanelEvent {
-    let captured = bodies
-    let raw = try #require(captured.first, sourceLocation: sourceLocation)
-    return try JSONDecoder().decode(OpenPanelEvent.self, from: raw)
+    let capturedBodies = bodies
+    let rawBody = try #require(capturedBodies.first, sourceLocation: sourceLocation)
+    return try JSONDecoder().decode(OpenPanelEvent.self, from: rawBody)
   }
 
   func lastEnvelope(sourceLocation: SourceLocation = #_sourceLocation) throws -> OpenPanelEvent {
-    let captured = bodies
-    let raw = try #require(captured.last, sourceLocation: sourceLocation)
-    return try JSONDecoder().decode(OpenPanelEvent.self, from: raw)
+    let capturedBodies = bodies
+    let rawBody = try #require(capturedBodies.last, sourceLocation: sourceLocation)
+    return try JSONDecoder().decode(OpenPanelEvent.self, from: rawBody)
   }
 }
 
@@ -90,27 +99,31 @@ extension MockURLProtocol.Registry {
 
 extension OpenPanelEvent {
   var trackPayload: TrackPayload? {
-    if case let .track(p) = self { p } else { nil }
+    if case let .track(payload) = self { payload } else { nil }
   }
 
   var identifyPayload: IdentifyPayload? {
-    if case let .identify(p) = self { p } else { nil }
+    if case let .identify(payload) = self { payload } else { nil }
   }
 
   var groupPayload: GroupPayload? {
-    if case let .group(p) = self { p } else { nil }
+    if case let .group(payload) = self { payload } else { nil }
   }
 
   var assignGroupPayload: AssignGroupPayload? {
-    if case let .assignGroup(p) = self { p } else { nil }
+    if case let .assignGroup(payload) = self { payload } else { nil }
   }
 
   var incrementPayload: IncrementPayload? {
-    if case let .increment(p) = self { p } else { nil }
+    if case let .increment(payload) = self { payload } else { nil }
   }
 
   var decrementPayload: DecrementPayload? {
-    if case let .decrement(p) = self { p } else { nil }
+    if case let .decrement(payload) = self { payload } else { nil }
+  }
+
+  var aliasPayload: AliasPayload? {
+    if case let .alias(payload) = self { payload } else { nil }
   }
 }
 
@@ -119,12 +132,13 @@ extension OpenPanelEvent {
 extension OpenPanelEvent: CustomTestStringConvertible {
   public var testDescription: String {
     switch self {
-    case let .track(p): "track(\"\(p.name)\")"
-    case let .identify(p): "identify(\(p.profileId.testDescription))"
-    case let .group(p): "group(\"\(p.id)\", type: \(p.type))"
-    case let .assignGroup(p): "assignGroup(\(p.groupIds))"
-    case let .increment(p): "increment(\(p.property))"
-    case let .decrement(p): "decrement(\(p.property))"
+    case let .track(payload): "track(\"\(payload.name)\")"
+    case let .identify(payload): "identify(\(payload.profileId.testDescription))"
+    case let .group(payload): "group(\"\(payload.id)\", type: \(payload.type))"
+    case let .assignGroup(payload): "assignGroup(\(payload.groupIds))"
+    case let .increment(payload): "increment(\(payload.property))"
+    case let .decrement(payload): "decrement(\(payload.property))"
+    case let .alias(payload): "alias(\"\(payload.profileId)\" <- \"\(payload.alias)\")"
     }
   }
 }
@@ -132,9 +146,9 @@ extension OpenPanelEvent: CustomTestStringConvertible {
 extension ProfileId: CustomTestStringConvertible {
   public var testDescription: String {
     switch self {
-    case let .string(s): "\"\(s)\""
-    case let .int(i): "\(i)"
-    case let .double(d): "\(d)"
+    case let .string(stringValue): "\"\(stringValue)\""
+    case let .int(intValue): "\(intValue)"
+    case let .double(doubleValue): "\(doubleValue)"
     }
   }
 }

@@ -15,7 +15,7 @@ struct PreconditionTests {
   /// ever silently degrades to a no-op, this suite fails.
   @Test
   func `calling track before initialize crashes the process`() async {
-    await #expect(processExitsWith: .failure) {
+    await #expect(processExitsWith: ExitTest.Condition.failure) {
       // Fresh subprocess → singleton is uninitialized → ensureInitialized() traps.
       await OpenPanel.shared.track("event")
     }
@@ -23,7 +23,7 @@ struct PreconditionTests {
 
   @Test
   func `calling identify before initialize crashes the process`() async {
-    await #expect(processExitsWith: .failure) {
+    await #expect(processExitsWith: ExitTest.Condition.failure) {
       await OpenPanel.shared.identify(IdentifyPayload(profileId: "u"))
     }
   }

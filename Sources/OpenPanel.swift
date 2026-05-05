@@ -44,6 +44,14 @@ public actor OpenPanel {
   var queue: [OpenPanelEvent] = []
   /// When `true`, events are queued in memory until ``ready()`` is called.
   var disabled: Bool = false
+  /// Set from `Config.waitForProfile`. While `true`, events queue locally
+  /// until ``identify(_:)`` supplies a profileId. Independent of ``disabled``;
+  /// both must be `false` for events to leave the process.
+  var waitingForProfile: Bool = false
+  /// `true` while ``drainQueue()`` is in flight. Concurrent ``send(_:)``
+  /// calls route through the queue while this is set, so live events can't
+  /// jump ahead of queued ones on the wire.
+  var draining: Bool = false
 
   /// Server-issued device identifier. `nil` until the first successful response.
   public internal(set) var deviceId: String?

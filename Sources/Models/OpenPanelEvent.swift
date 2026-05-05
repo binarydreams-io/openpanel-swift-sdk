@@ -23,12 +23,14 @@ public enum OpenPanelEvent: Sendable, Equatable {
   case increment(IncrementPayload)
   /// Decrement a numeric profile property atomically server-side.
   case decrement(DecrementPayload)
+  /// Merge two profiles together (typically anon → logged-in).
+  case alias(AliasPayload)
 }
 
 extension OpenPanelEvent: Codable {
   private enum Keys: String, CodingKey { case type, payload }
   private enum Kind: String, Codable {
-    case track, identify, group, assign_group, increment, decrement
+    case track, identify, group, assign_group, increment, decrement, alias
   }
 
   public init(from decoder: Decoder) throws {
@@ -40,6 +42,7 @@ extension OpenPanelEvent: Codable {
     case .assign_group: self = try .assignGroup(container.decode(AssignGroupPayload.self, forKey: .payload))
     case .increment: self = try .increment(container.decode(IncrementPayload.self, forKey: .payload))
     case .decrement: self = try .decrement(container.decode(DecrementPayload.self, forKey: .payload))
+    case .alias: self = try .alias(container.decode(AliasPayload.self, forKey: .payload))
     }
   }
 
@@ -63,6 +66,9 @@ extension OpenPanelEvent: Codable {
       try container.encode(payload, forKey: .payload)
     case let .decrement(payload):
       try container.encode(Kind.decrement, forKey: .type)
+      try container.encode(payload, forKey: .payload)
+    case let .alias(payload):
+      try container.encode(Kind.alias, forKey: .type)
       try container.encode(payload, forKey: .payload)
     }
   }

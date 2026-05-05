@@ -20,6 +20,8 @@ extension OpenPanel {
     deviceId = nil
     sessionId = nil
     self.disabled = disabled
+    waitingForProfile = config.waitForProfile
+    draining = false
   }
 
   /// Fully un-configures the singleton. Only for tests — `@testable import OpenPanel`
@@ -34,6 +36,8 @@ extension OpenPanel {
     deviceId = nil
     sessionId = nil
     disabled = false
+    waitingForProfile = false
+    draining = false
   }
 
   /// Crashes if the SDK has not been configured.
@@ -48,31 +52,93 @@ extension OpenPanel {
     }
   }
 
+  /// Builds a `TrackPayload` from caller-supplied data plus SDK-managed
+  /// reserved keys (device metadata + any extra reserved keys passed by
+  /// internal callers like `revenue`). Last-write wins on key collision:
+  /// global → user → device metadata → caller-supplied reserved.
+  func buildTrackPayload(
+    name: String,
+    userProperties: [String: String]?,
+    reserved: [String: String],
+    profileId: ProfileId?,
+    extraGroups: [String]?
+  ) -> TrackPayload {
+    // `global` is already stripped at write-time by `setGlobalProperties`.
+    var mergedProperties = global
+    if let userProperties {
+      mergedProperties.merge(stripReserved(userProperties)) { _, new in new }
+    }
+    mergedProperties.merge(DeviceInfo.metadata) { _, new in new }
+    mergedProperties.merge(reserved) { _, new in new }
+    return TrackPayload(
+      name: name,
+      properties: mergedProperties,
+      profileId: profileId,
+      groups: effectiveGroups(extra: extraGroups)
+    )
+  }
+
+  /// Union of actor-stored groups with caller-supplied extras. Returns `nil`
+  /// when empty so encoding omits the field rather than emitting `[]`.
+  func effectiveGroups(extra: [String]?) -> [String]? {
+    let combinedGroups = groups.union(extra ?? [])
+    return combinedGroups.isEmpty ? nil : Array(combinedGroups)
+  }
+
+  /// Drops reserved keys (prefix `__`) from caller-supplied properties.
+  /// Reserved keys are SDK-managed (`__brand`, `__os`, `__osVersion`,
+  /// `__device`, `__model`, `__timestamp`, `__revenue`, `__deviceId`) —
+  /// accepting them from the caller would let user input clobber server-side
+  /// semantics.
+  func stripReserved(_ properties: [String: String]) -> [String: String] {
+    var filteredProperties: [String: String] = [:]
+    filteredProperties.reserveCapacity(properties.count)
+    for (key, value) in properties {
+      if key.hasPrefix("__") {
+        log("Ignored reserved property '\(key)' — keys starting with '__' are SDK-managed")
+        continue
+      }
+      filteredProperties[key] = value
+    }
+    return filteredProperties
+  }
+
   func log(_ message: @autoclosure () -> String, to logger: Logger = OpenPanel.apiLog) {
     guard config?.debug == true else { return }
-    let text = message()
-    logger.debug("\(text)")
+    let formattedMessage = message()
+    logger.debug("\(formattedMessage)")
   }
 
   @discardableResult
   func send(_ envelope: OpenPanelEvent) async -> Bool {
-    guard let config, let transport else { return false }
+    guard let config, transport != nil else { return false }
 
     if let filter = config.filter, !filter(envelope) {
       log("Filtered event: \(envelope)")
       return true
     }
 
-    if disabled {
-      queue.append(stamped(envelope))
+    // `draining` keeps live events behind the in-flight drain so the server
+    // sees them in submission order.
+    if disabled || waitingForProfile || draining {
+      queue.append(stampTimestamp(envelope))
       if queue.count > config.maxQueueSize {
-        let dropped = queue.removeFirst()
-        log("Queue full (max=\(config.maxQueueSize)) — dropped oldest: \(dropped)", to: OpenPanel.queueLog)
+        let droppedEvent = queue.removeFirst()
+        log("Queue full (max=\(config.maxQueueSize)) — dropped oldest: \(droppedEvent)", to: OpenPanel.queueLog)
       }
       log("Queued event: \(envelope)", to: OpenPanel.queueLog)
       return true
     }
 
+    return await sendDirect(envelope)
+  }
+
+  /// Bypasses the queue/filter gate and goes straight to the transport.
+  /// Only ``drainQueue()`` should call this — every other write path must
+  /// go through ``send(_:)`` so the queue/filter checks apply.
+  @discardableResult
+  func sendDirect(_ envelope: OpenPanelEvent) async -> Bool {
+    guard let transport else { return false }
     log("Sending event: \(envelope)", to: OpenPanel.transportLog)
     do {
       let response: TrackResponse? = try await transport.post(path: "/track", body: envelope)
@@ -81,6 +147,8 @@ extension OpenPanel {
         sessionId = response.sessionId
       }
       return true
+    } catch is CancellationError {
+      return false
     } catch {
       log("Send failed: \(error)", to: OpenPanel.transportLog)
       return false
@@ -89,13 +157,13 @@ extension OpenPanel {
 
   /// Stamps queued `track` events with `__timestamp` so the server records
   /// the original event time rather than the flush time.
-  private func stamped(_ envelope: OpenPanelEvent) -> OpenPanelEvent {
+  private func stampTimestamp(_ envelope: OpenPanelEvent) -> OpenPanelEvent {
     guard case var .track(payload) = envelope else { return envelope }
-    var props = payload.properties ?? [:]
-    if props["__timestamp"] == nil {
-      props["__timestamp"] = Date.now.ISO8601Format(.iso8601WithTimeZone(includingFractionalSeconds: true))
+    var properties = payload.properties ?? [:]
+    if properties["__timestamp"] == nil {
+      properties["__timestamp"] = Date.now.ISO8601Format(.iso8601WithTimeZone(includingFractionalSeconds: true))
     }
-    payload.properties = props
+    payload.properties = properties
     return .track(payload)
   }
 
@@ -109,15 +177,22 @@ extension OpenPanel {
     return .track(payload)
   }
 
+  /// Drains the queue head-first, one event per iteration. The `draining`
+  /// flag forces concurrent ``send(_:)`` calls to enqueue rather than race
+  /// past us, so wire order matches submission order. Re-entrant calls are
+  /// no-ops.
   func drainQueue() async {
-    guard config != nil, !disabled else { return }
-    let pending = queue
-    queue.removeAll()
-    for (index, envelope) in pending.enumerated() {
-      if await !send(enriched(envelope)) {
-        // Network failure during drain — preserve order by re-queueing the
-        // failed event together with anything we haven't tried yet.
-        queue.insert(contentsOf: pending[index...], at: 0)
+    guard config != nil, !disabled, !waitingForProfile, !draining else { return }
+    draining = true
+    defer { draining = false }
+
+    while let envelope = queue.first {
+      queue.removeFirst()
+      if await !sendDirect(enriched(envelope)) {
+        // Network failure — put it back at the head and stop. Anything
+        // appended via `send()` while we were suspended is already behind
+        // it, so order is preserved.
+        queue.insert(envelope, at: 0)
         return
       }
     }
